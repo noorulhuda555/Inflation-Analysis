@@ -1,0 +1,554 @@
+---
+Advance Stattistics project
+Analysis of Factirs affecting Inflation in Pakistan
+---
+
+Loading necessary libraries 
+
+```{r}
+library(readxl) #read excel files
+library(forecast) #for arima 
+library(glmnet) #for lasso, ridge, elastic net etc
+library(caret)# for train()
+library(tidyr) #pivot_longer (reshaping, tidying data)
+library(ggplot2) #data visulization graphs
+library(lubridate) #for date formats 
+library(dplyr) #mutate, filter etc
+library(openxlsx) #write to excel sheets 
+library(zoo) #missing values 
+```
+
+```{r}
+
+data <- read_excel("C:\\Users\\nooru\\Documents\\adv_proj\\data_from_1980.xlsx")
+
+colnames(data) <- trimws(colnames(data)) #remove extra white space from names
+
+#convert all cols to numeric type except time
+data[ , -1] <- lapply(data[ , -1], function(x) as.numeric(as.character(x))) 
+#data[, 1] selects all cols except 1st i.e time
+
+# Preserve the original time column
+time_col <- data[[1]]
+
+```
+
+```{r}
+plot(ts(data$`Inflation`, start = 1980, frequency = 1), main = "Inflation Time Series", col = "red")
+
+# $ sign extract specific col from data 
+```
+fill missing values
+```{r}
+
+
+data[ , -1] <- lapply(data[ , -1], function(col) {
+  filled <- zoo::na.approx(col, na.rm = FALSE)                  # Linear interpolation i.e estimating missing values by usng missing values b/w 2 points 
+  filled <- zoo::na.locf(filled, na.rm = FALSE, fromLast = TRUE) # Backward fill last observation carried backwards 
+  filled <- zoo::na.locf(filled, na.rm = FALSE)                  # Forward fill last value carries forward
+  return(filled)
+})
+
+# Restore the time column
+data[[1]] <- time_col
+
+# Sort data by time
+data <- data %>% arrange(data[[1]]) #%>% is the pipe operator passes data into arrange funtcion
+
+```
+
+Mean , median, mode, q1, q3 
+```{r}
+# Compute Mean, Median, Mode, Q1, Q3
+summary_stats <- data.frame(
+  Variable = colnames(data)[-1], #all cols excpet time
+  Mean = sapply(data[,-1], mean), #apply mean function to all cols 
+  Median = sapply(data[,-1], median), #medan to all 
+  Mode = sapply(data[,-1], function(x)  #mode to all cols
+    { 
+    ux <- na.omit(x)  #frequenct table 
+    as.numeric(names(sort(table(ux), decreasing = TRUE))[1]) #sort by decreasing so gets highest frequnecy value i.e the mode 
+  }),
+  Q1 = sapply(data[,-1], quantile, 0.25), #apply qunatile function to get q1
+  Q3 = sapply(data[,-1], quantile, 0.75)#q3
+)
+
+```
+
+IQR 
+```{r}
+summary_stats$IQR <- summary_stats$Q3 - summary_stats$Q1 #for each variable it calculated iqr in dataframe
+
+# Calculate number of outliers using 1.5 * IQR rule
+summary_stats$Outliers <- sapply(seq_along(data[,-1]), function(i) #seq_along creates a sequnece of integers 
+  {
+  x <- data[[i + 1]] #skip first col 
+  q1 <- quantile(x, 0.25)
+  q3 <- quantile(x, 0.75)
+  iqr <- q3 - q1
+  sum(x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr))
+})
+
+```
+
+```{r}
+# Print summary statistics
+print(summary_stats)
+
+```
+
+
+```{r}
+# Get outlier values for each variable using 1.5 * IQR rule
+outliers_list <- lapply(seq_along(data[,-1]), function(i) {
+  x <- data[[i + 1]]  # Skip the first column (Time)
+  q1 <- quantile(x, 0.25)
+  q3 <- quantile(x, 0.75)
+  iqr <- q3 - q1
+  outliers <- x[x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)]
+  return(outliers)
+})
+
+names(outliers_list) <- colnames(data)[-1]
+
+# Print outliers per variable
+print(outliers_list)
+
+```
+
+```{r}
+library(tidyverse)
+
+
+df <- data
+
+# Convert to long format as required by ggplot vertically format data 
+df_long <- df %>%
+  pivot_longer(
+    cols = -Time,
+    names_to = "Variable",
+    values_to = "Value"
+  )
+
+# Create scatter plot grid
+ggplot(df_long, aes(x = Time, y = Value)) +
+  geom_point(color = "orange", alpha = 0.6) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Economic Indicators Over Time",
+    x = "Year",
+    y = "Value"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"), #labels se text uthata hai 
+    plot.title = element_text(hjust = 0.5, size = 14) 
+  )
+
+```
+```{r}
+library(tidyr)
+library(ggplot2)
+
+df_long <- data %>%
+  pivot_longer(cols = -1, names_to = "Variable", values_to = "Value")
+
+ggplot(df_long, aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot(outlier.color = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Box and Whisker Plot of Economic Indicators",
+       x = "Economic Indicator",
+       y = "Value") +
+  guides(fill = "none") 
+```
+
+```{r}
+# Define the target variable
+y <- data$Inflation
+
+# Define the feature set (drop Time and Inflation columns)
+x <- data %>%
+  select(-Time, -Inflation)
+
+# Ensure numeric
+x <- as.data.frame(lapply(x, function(col) as.numeric(as.character(col))))
+
+#Stop if any column is not numeric
+stopifnot(all(sapply(x, is.numeric)))
+
+```
+
+making infaltion stationary 
+```{r}
+library(forecast)
+library(tseries)
+
+# Step 1: Convert Inflation to a time series object
+start_year <- 1980
+freq <- 1  # yearly data
+ts_inflation <- ts(data$Inflation, start = start_year, frequency = freq)
+
+adf_test_inflation <- adf.test(ts_inflation)
+
+# Step 3: If p-value > 0.05, make Inflation stationary by differencing
+if (adf_test_inflation$p.value > 0.05) {
+  ts_inflation <- diff(ts_inflation)
+}
+
+data$Inflation <- c(0, ts_inflation)  
+
+
+```
+arima  model
+
+```{r}
+
+data_numeric <- data.frame(lapply(data, function(x) as.numeric(as.character(x))))
+
+xreg_matrix <- as.matrix(data_numeric[, colnames(data_numeric) != "Inflation"])
+
+# Fit the ARIMA model
+arima_model <- auto.arima(data_numeric$Inflation, xreg = xreg_matrix)
+
+
+summary(arima_model)
+
+
+
+
+```
+sigma^2: 19.6 indicates the variance of the residuals (errors), showing how spread out the predictions are from the actual values. A lower value indicates a better fit.
+
+Log Likelihood: -126.06 is used to compare different models; higher values (closer to zero) indicate a better fit.
+
+ME (Mean Error): 4.9996e-05 is very close to zero, indicating that the model is not biased (i.e., it does not systematically overestimate or underestimate).
+
+RMSE (Root Mean Squared Error): 3.7493, a standard measure of prediction error. A lower RMSE indicates better prediction accuracy.
+
+MAE (Mean Absolute Error): 2.4771, showing the average absolute difference between the model's predictions and actual values.
+
+MPE (Mean Percentage Error):avg of percentage of errors. likely due to division by zero .
+
+MAPE (Mean Absolute Percentage Error): "Inf" suggests very large errors, possibly due to outliers or very small actual values.
+
+MASE (Mean Absolute Scaled Error): 0.6287, another measure of error. Values close to 1 indicate acceptable accuracy.
+
+ACF1 (Autocorrelation of residuals): -0.1099 suggests that there's some autocorrelation in the residuals, meaning the model might not fully capture the patterns in the data.
+```{r}
+
+
+```
+
+lasso model 
+
+n LASSO (Least Absolute Shrinkage and Selection Operator), lambda (also known as the regularization parameter) is a key parameter that controls the strength of the regularization applied to the model. The purpose of LASSO is to shrink the regression coefficients of less important predictors towards zero, effectively performing feature selection.
+
+```{r}
+library(glmnet)
+library(caret)
+
+data_numeric <- data.frame(lapply(data, function(x) as.numeric(as.character(x))))
+
+target_variable <- "Inflation"
+predictors <- colnames(data_numeric)[colnames(data_numeric) != target_variable & colnames(data_numeric) != "Year"]
+
+X <- as.matrix(data_numeric[, predictors])  # Predictor matrix
+Y <- data_numeric[, target_variable]        # Target vector
+
+lasso_cv <- cv.glmnet(X, Y, alpha = 1)  # alpha = 1 means LASSO
+
+# Get the optimal lambda from cross-validation
+best_lambda <- lasso_cv$lambda.min
+
+#Fit the LASSO model with the optimal lambda
+lasso_model <- glmnet(X, Y, alpha = 1, lambda = best_lambda)
+
+lasso_coef_matrix <- as.matrix(lasso_coef)
+
+# Extract the non-zero coefficients and their corresponding variable names
+non_zero_lasso_coefs <- lasso_coef_matrix[lasso_coef_matrix != 0]
+
+#Get the names of the predictors corresponding to non-zero coefficients
+non_zero_predictor_names <- rownames(lasso_coef_matrix)[lasso_coef_matrix != 0]
+
+# Combine them into a simple data frame
+non_zero_df <- data.frame(Predictor = non_zero_predictor_names, Coefficient = non_zero_lasso_coefs)
+
+print(non_zero_df)
+```
+ridge model 
+
+Ridge Regression (alpha = 0): Ridge regression penalizes the sum of the squared coefficients 
+helps in shrinking the coefficients towards zero, but unlike LASSO, 
+it does not set coefficients to exactly zero. 
+It keeps all predictors in the model, though their coefficients might become very small.
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Convert all columns to numeric
+data_numeric <- data.frame(lapply(data, function(x) as.numeric(as.character(x))))
+
+target_variable <- "Inflation"
+predictors <- colnames(data_numeric)[colnames(data_numeric) != target_variable & colnames(data_numeric) != "Year"]
+
+X <- as.matrix(data_numeric[, predictors])  # Predictor matrix
+Y <- data_numeric[, target_variable]        # Target vector
+
+ridge_cv <- cv.glmnet(X, Y, alpha = 0)
+best_lambda_ridge <- ridge_cv$lambda.min
+ridge_model <- glmnet(X, Y, alpha = 0, lambda = best_lambda_ridge)
+ridge_coef <- coef(ridge_model)
+ridge_coef_matrix <- as.matrix(ridge_coef)
+
+
+# Extract the non-zero coefficients and their corresponding variable names
+non_zero_ridge_coefs <- ridge_coef_matrix[ridge_coef_matrix != 0]
+
+#Get the names of the predictors corresponding to non-zero coefficients
+non_zero_ridge_names <- rownames(ridge_coef_matrix)[ridge_coef_matrix != 0]
+
+# Combine them into a simple data frame
+non_zero_df_ridge <- data.frame(Predictor = non_zero_ridge_names, Coefficient = non_zero_ridge_coefs)
+
+print(non_zero_df_ridge)
+
+```
+elastic net 
+
+The non-zero coefficients in the output are the predictors that have a significant effect on the target variable (Inflation in this case) after regularization. These are the features that are retained in the model.
+```{r}
+
+elastic_cv <- cv.glmnet(X, Y, alpha = 0.5)
+best_lambda_elastic <- elastic_cv$lambda.min
+elastic_model <- glmnet(X, Y, alpha = 0.5, lambda = best_lambda_elastic)
+elastic_coef <- coef(elastic_model)
+elastic_coef_matrix <- as.matrix(elastic_coef)
+# Extract the non-zero coefficients and their corresponding variable names
+non_zero_elastic_coefs <- elastic_coef_matrix[elastic_coef_matrix != 0]
+
+#Get the names of the predictors corresponding to non-zero coefficients
+non_zero_elastic_names <- rownames(elastic_coef_matrix)[elastic_coef_matrix != 0]
+
+# Combine them into a simple data frame
+non_zero_df_elastic <- data.frame(Predictor = non_zero_elastic_names, Coefficient = non_zero_elastic_coefs)
+
+print(non_zero_df_elastic)
+
+```
+forecasting 
+```{r}
+#Define total number of rows and how many to keep for testing
+n <- nrow(x)
+n_test <- 5
+n_train <- n - n_test
+
+x_train <- x[1:n_train, ]
+x_test <- x[(n_train + 1):n, ]
+y_train <- y[1:n_train]
+y_test <- y[(n_train + 1):n]
+
+x_train_mat <- matrix(as.numeric(unlist(x_train)), ncol = ncol(x_train))
+x_test_mat <- matrix(as.numeric(unlist(x_test)), ncol = ncol(x_test))
+```
+
+```{r}
+arima_model <- auto.arima(y_train, xreg = x_train_mat)
+arima_pred <- forecast(arima_model, xreg = x_test_mat)$mean
+```
+
+```{r}
+lasso_model <- cv.glmnet(x_train_mat, y_train, alpha = 1)
+lasso_pred <- predict(lasso_model, s = "lambda.min", newx = x_test_mat) 
+```
+
+```{r}
+ridge_model <- cv.glmnet(x_train_mat, y_train, alpha = 0)
+ridge_pred <- predict(ridge_model, s = "lambda.min", newx = x_test_mat)
+```
+
+```{r}
+elastic_model <- cv.glmnet(x_train_mat, y_train, alpha = 0.5)
+elastic_pred <- predict(elastic_model, s = "lambda.min", newx = x_test_mat)
+```
+
+```{r}
+length(y_test)
+length(arima_pred)
+length(lasso_pred)
+length(ridge_pred)
+length(elastic_pred)
+```
+results 
+```{r}
+#results df
+results <- data.frame(
+  Actual = y_test,
+  ARIMA = arima_pred,
+  LASSO = as.numeric(lasso_pred),
+  Ridge = as.numeric(ridge_pred),
+  ElasticNet = as.numeric(elastic_pred)
+)
+
+# --- Mean Squared Errors ---
+mse <- colMeans((results[,-1] - results$Actual)^2)
+cat("MSE:\n")
+print(round(mse, 3))
+
+# --- R-squared function ---
+r_squared <- function(actual, predicted) {
+  ss_res <- sum((actual - predicted)^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  return(1 - ss_res / ss_tot)
+}
+
+# --- R-squared values for all models ---
+r2_values <- sapply(results[,-1], function(pred) r_squared(results$Actual, pred))
+cat("\nR-squared:\n")
+print(round(r2_values, 3))
+```
+```{r}
+library(ggplot2)
+library(tidyr)
+
+# Index for x-axis
+results$Index <- seq_along(results$Actual)
+
+# Convert to long format including all models
+results_long <- pivot_longer(
+  results,
+  cols = c("ARIMA", "LASSO", "Ridge", "ElasticNet"),
+  names_to = "Model",
+  values_to = "Predicted"
+)
+
+# Plot Actual vs Predicted
+ggplot(results_long, aes(x = Index)) +
+  geom_line(aes(y = Actual), color = "black", size = 1, linetype = "dashed") +
+  geom_line(aes(y = Predicted, color = Model), size = 1) +
+  labs(
+    title = "Split 1: Actual vs Predicted Inflation (ARIMA vs LASSO vs Ridge vs ElasticNet)",
+    x = "Time Index",
+    y = "Value",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+```
+2nd test
+```{r}
+# Create training and testing 
+
+set.seed(123)
+index <- createDataPartition(y, p = 0.8, list = FALSE)
+x_train1 <- as.matrix(x[index, ])
+x_test1 <- as.matrix(x[-index, ])
+y_train1 <- y[index]
+y_test1 <- y[-index]
+```
+
+```{r}
+# Fit ARIMA model with xreg
+arima_model <- auto.arima(y_train1, xreg = x_train1)
+
+# Forecast using x_test
+arima_forecast <- forecast(arima_model, xreg = x_test1)
+arima_pred <- as.numeric(arima_forecast$mean)
+
+```
+
+```{r}
+# Train LASSO model
+lasso_model <- cv.glmnet(x_train1, y_train1, alpha = 1)
+ 
+# Predict using LASSO
+lasso_pred <- predict(lasso_model, s = "lambda.min", newx = x_test1)
+
+```
+
+```{r}
+ridge_model <- cv.glmnet(x_train1, y_train1, alpha = 0)
+ridge_pred <- as.numeric(predict(ridge_model, s = "lambda.min", newx = x_test1))
+
+```
+
+```{r}
+# --- Fit Elastic Net (alpha = 0.5) ---
+elastic_model <- cv.glmnet(x_train1, y_train1, alpha = 0.5)
+elastic_pred <- as.numeric(predict(elastic_model, s = "lambda.min", newx = x_test1))
+```
+
+```{r}
+# Create results data frame
+# Combine all predictions into results dataframe
+results <- data.frame(
+  Actual = y_test1,
+  ARIMA = arima_pred,
+  LASSO = lasso_pred,
+  Ridge = ridge_pred,
+  ElasticNet = elastic_pred
+)
+
+colnames(results)[colnames(results) == "lambda.min"] 
+
+# --- Mean Squared Errors ---
+mse <- colMeans((results[,-1] - results$Actual)^2)
+cat("MSE:\n")
+print(round(mse, 3))
+
+# --- R-squared Function ---
+r_squared <- function(actual, predicted) {
+  ss_res <- sum((actual - predicted)^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  return(1 - ss_res / ss_tot)
+}
+
+# --- R-squared for All Models ---
+r2_values <- sapply(results[,-1], function(pred) r_squared(results$Actual, pred))
+cat("\nR-squared:\n")
+print(round(r2_values, 3))
+
+```
+```{r}
+str(results)
+```
+```{r}
+colnames(results)[colnames(results) == "lambda.min"] <- "LASSO"
+
+```
+
+
+```{r}
+
+```
+```{r}
+
+
+results_long <- data.frame(
+  Index = 1:nrow(results),
+  Actual = results$Actual,
+  ARIMA = results$ARIMA,
+  LASSO = results$LASSO,
+  Ridge = results$Ridge,
+  ElasticNet = results$ElasticNet
+)
+
+results_long_melt <- melt(results_long, id.vars = "Index")
+
+ggplot(results_long_melt, aes(x = Index, y = value, color = variable, linetype = variable)) +
+  geom_line(size = 1.2) +
+  labs(title = "Split 2: Actual vs Predicted Inflation (ARIMA, LASSO, Ridge, Elastic Net)",
+       x = "Observation Index",
+       y = "Inflation Rate",
+       color = "Series",
+       linetype = "Series") +
+  theme_minimal() +
+  scale_color_manual(values = c("black", "red", "blue", "green", "purple")) +
+  theme(text = element_text(size = 12),
+        legend.position = "top")
+
+```
+
+
